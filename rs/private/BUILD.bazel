@@ -3,6 +3,7 @@ load("@bazel_skylib//rules:common_settings.bzl", "bool_setting")
 load("@rules_rust//rust:defs.bzl", "rust_stdlib_filegroup")
 load(":all_crate_deps_test.bzl", "all_crate_deps_tests")
 load(":bpf_linker_repository_test.bzl", "bpf_linker_repository_tests")
+load(":cargo_unit_graph_test.bzl", "cargo_unit_graph_tests")
 load(":cargo_workspace_graph_test.bzl", "cargo_workspace_graph_tests")
 load(":cfg_parser_test.bzl", "cfg_parser_tests")
 load(":lint_flags_test.bzl", "lint_flags_tests")
@@ -23,6 +24,8 @@ rust_stdlib_filegroup(
 all_crate_deps_tests()
 
 bpf_linker_repository_tests()
+
+cargo_unit_graph_tests()
 
 cargo_workspace_graph_tests()
 
@@ -97,6 +100,21 @@ bzl_library(
         ":registry_utils",
         ":toml2json",
         "@bazel_tools//tools/build_defs/repo:git_worker.bzl",
+    ],
+)
+
+bzl_library(
+    name = "cargo_unit_graph",
+    srcs = ["cargo_unit_graph.bzl"],
+    visibility = ["//rs:__subpackages__"],
+)
+
+bzl_library(
+    name = "cargo_unit_graph_test",
+    srcs = ["cargo_unit_graph_test.bzl"],
+    deps = [
+        ":cargo_unit_graph",
+        "@bazel_skylib//lib:unittest",
     ],
 )
 

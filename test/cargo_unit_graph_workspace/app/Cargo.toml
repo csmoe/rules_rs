@@ -1,0 +1,21 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+
+[features]
+default = ["json", "local_util/fancy"]
+json = ["dep:serde_json"]
+
+[dependencies]
+itoa = "1.0.15"
+local_util = { path = "../local_util", default-features = false }
+serde_json = { version = "1.0", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+cfg-if = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation"] }

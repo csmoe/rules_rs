@@ -416,6 +416,49 @@ def resolve_cargo_metadata_packages(packages, cargo_metadata, platform_triples, 
         skip_internal_rustc_placeholder_crates = skip_internal_rustc_placeholder_crates,
     )
 
+def initialize_workspace_unit_graph_resolution(cargo_metadata, versions_by_name, feature_resolutions_by_fq_crate, platform_triples, skip_internal_rustc_placeholder_crates = True):
+    platform_cfg_attrs = [triple_to_cfg_attrs(triple) for triple in platform_triples]
+    platform_cfg_attrs_by_triple = {}
+    for cfg_attr in platform_cfg_attrs:
+        platform_cfg_attrs_by_triple[cfg_attr["_triple"]] = cfg_attr
+
+    resolver_versions_by_name = {name: versions[:] for name, versions in versions_by_name.items()}
+    package_index = len(feature_resolutions_by_fq_crate)
+    for package in cargo_metadata["packages"]:
+        name = package["name"]
+        version = package["version"]
+        fq = fq_crate(name, version)
+
+        versions = resolver_versions_by_name.get(name, [])
+        if version not in versions:
+            if versions:
+                versions.append(version)
+            else:
+                resolver_versions_by_name[name] = [version]
+
+        if fq in feature_resolutions_by_fq_crate:
+            continue
+
+        possible_deps = prepare_possible_deps(
+            package.get("dependencies", []),
+            converter = cargo_metadata_dep_to_dep_dict,
+            skip_internal_rustc_placeholder_crates = skip_internal_rustc_placeholder_crates,
+        )
+        feature_resolutions_by_fq_crate[fq] = new_feature_resolutions(
+            package_index,
+            possible_deps,
+            package.get("features", {}),
+            platform_triples,
+        )
+        package_index += 1
+
+    return struct(
+        cfg_match_cache = {None: struct(matches = platform_triples, uses_feature_cfg = False)},
+        platform_cfg_attrs = platform_cfg_attrs,
+        platform_cfg_attrs_by_triple = platform_cfg_attrs_by_triple,
+        versions_by_name = resolver_versions_by_name,
+    )
+
 def _resolve_possible_deps(
         packages,
         resolver_versions_by_name,
@@ -670,7 +713,8 @@ def workspace_dep_data(
         cfg_match_cache,
         repo_root,
         workspace_package,
-        use_legacy_rules_rust_platforms):
+        use_legacy_rules_rust_platforms,
+        use_resolved_deps = False):
     dep_data = {}
     for package in cargo_metadata["packages"]:
         aliases = {}
@@ -702,45 +746,51 @@ def workspace_dep_data(
             elif "bin" in kinds:
                 binaries[target["name"]] = entrypoint
 
-        for dep in package["dependencies"]:
-            bazel_target = dep.get("bazel_target")
-            dep_path = dep.get("path")
-            if not bazel_target:
-                if not dep_path:
-                    continue
-                bazel_target = "//" + paths.join(workspace_package, normalize_path(dep_path).removeprefix(repo_root + "/"))
+        if use_resolved_deps and feature_resolutions:
+            aliases.update(feature_resolutions.aliases)
+            for triple in platform_triples:
+                deps[triple].update(feature_resolutions.deps[triple])
+                build_deps[triple].update(feature_resolutions.build_deps[triple])
+        else:
+            for dep in package["dependencies"]:
+                bazel_target = dep.get("bazel_target")
+                dep_path = dep.get("path")
+                if not bazel_target:
+                    if not dep_path:
+                        continue
+                    bazel_target = "//" + paths.join(workspace_package, normalize_path(dep_path).removeprefix(repo_root + "/"))
 
-            is_self_dep = dep_path and normalize_path(dep_path) == package_manifest_dir
+                is_self_dep = dep_path and normalize_path(dep_path) == package_manifest_dir
 
-            if not is_self_dep:
-                if dep.get("rename"):
-                    aliases[bazel_target] = dep["rename"].replace("-", "_")
-                elif dep_path:
-                    aliases[bazel_target] = dep["name"].replace("-", "_")
+                if not is_self_dep:
+                    if dep.get("rename"):
+                        aliases[bazel_target] = dep["rename"].replace("-", "_")
+                    elif dep_path:
+                        aliases[bazel_target] = dep["name"].replace("-", "_")
 
-            target = dep.get("target")
-            match_info = cfg_match_info_for_target(target, platform_cfg_attrs, cfg_match_cache)
-            match = match_info.matches
+                target = dep.get("target")
+                match_info = cfg_match_info_for_target(target, platform_cfg_attrs, cfg_match_cache)
+                match = match_info.matches
 
-            kind = dep["kind"]
-            if kind == "dev":
-                target_deps = dev_deps
-            elif kind == "build":
-                target_deps = build_deps
-            else:
-                target_deps = deps
+                kind = dep["kind"]
+                if kind == "dev":
+                    target_deps = dev_deps
+                elif kind == "build":
+                    target_deps = build_deps
+                else:
+                    target_deps = deps
 
-            for triple in match:
-                if dep.get("optional") and feature_resolutions:
-                    dep_name = dep.get("rename") or dep["name"]
-                    triple_features = feature_resolutions.features_enabled[triple]
-                    if dep_name not in triple_features and ("dep:" + dep_name) not in triple_features:
+                for triple in match:
+                    if dep.get("optional") and feature_resolutions:
+                        dep_name = dep.get("rename") or dep["name"]
+                        triple_features = feature_resolutions.features_enabled[triple]
+                        if dep_name not in triple_features and ("dep:" + dep_name) not in triple_features:
+                            continue
+
+                    if is_self_dep:
                         continue
 
-                if is_self_dep:
-                    continue
-
-                target_deps[triple].add(bazel_target)
+                    target_deps[triple].add(bazel_target)
 
         if feature_resolutions:
             for triple in platform_triples:

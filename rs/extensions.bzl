@@ -4,9 +4,11 @@ load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@rs_rust_host_tools//:defs.bzl", "RS_HOST_CARGO_LABEL")
 load("//rs/private:annotations.bzl", "annotation_for", "build_annotation_map", "well_known_annotation_snippet_paths")
 load("//rs/private:cargo_credentials.bzl", "load_cargo_credentials")
+load("//rs/private:cargo_unit_graph.bzl", "apply_unit_graphs_to_feature_resolutions", "collect_unit_graphs")
 load(
     "//rs/private:cargo_workspace_graph.bzl",
     "cargo_toml_fact",
+    "initialize_workspace_unit_graph_resolution",
     "platform_label",
     "render_dep_data",
     "render_string_list",
@@ -104,6 +106,8 @@ def _generate_hub_and_spokes(
         validate_lockfile,
         debug,
         use_legacy_rules_rust_platforms,
+        use_cargo_unit_graph,
+        cargo_unit_graph_modes,
         dry_run = False):
     """Generates repositories for the transitive closure of the Cargo workspace.
 
@@ -121,9 +125,13 @@ def _generate_hub_and_spokes(
         cargo_config (label): .cargo/config.toml file
         validate_lockfile (bool): If true, validate we have appropriate versions in Cargo.lock
         debug (bool): Enable debug logging
+        use_cargo_unit_graph (bool): If true, read Cargo unit graph data for the requested modes/triples.
+        cargo_unit_graph_modes (list[string]): Cargo build commands to query with --unit-graph.
         dry_run (bool): Run all computations but do not create repos. Useful for benchmarking.
     """
     _date(mctx, "start")
+
+    unit_graphs = None
 
     mctx.report_progress("Reading workspace metadata")
     result = mctx.execute(
@@ -133,6 +141,21 @@ def _generate_hub_and_spokes(
     if result.return_code != 0:
         fail(result.stdout + "\n" + result.stderr)
     cargo_metadata = json.decode(result.stdout)
+
+    if use_cargo_unit_graph:
+        mctx.report_progress("Reading Cargo unit graph")
+        unit_graphs = collect_unit_graphs(
+            mctx,
+            cargo_path,
+            str(mctx.path(cargo_lock_path).dirname),
+            platform_triples,
+            cargo_unit_graph_modes,
+        )
+        if debug:
+            unit_count = 0
+            for unit_graph in unit_graphs.values():
+                unit_count += len(unit_graph.units)
+            print("Read %s Cargo unit graph units across %s graph(s)" % (unit_count, len(unit_graphs)))
 
     _date(mctx, "parsed cargo metadata")
 
@@ -257,26 +280,46 @@ def _generate_hub_and_spokes(
     # Only files in the current Bazel workspace can/should be watched, so check where our manifests are located.
     watch_manifests = cargo_lock_path.repo_name == ""
 
-    workspace_resolution = resolve_cargo_workspace_members(
-        mctx,
-        cargo_metadata = cargo_metadata,
-        packages = packages,
-        workspace_members = workspace_members,
-        versions_by_name = versions_by_name,
-        feature_resolutions_by_fq_crate = feature_resolutions_by_fq_crate,
-        annotations = annotations,
-        platform_triples = platform_triples,
-        materialize_workspace_members = False,
-        validate_lockfile = validate_lockfile,
-        debug = debug,
-        dep_label_prefix = "@%s//:" % hub_name,
-        watch_manifests = watch_manifests,
-        use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
-    )
-    cfg_match_cache = workspace_resolution.cfg_match_cache
-    platform_cfg_attrs = workspace_resolution.platform_cfg_attrs
-    workspace_dep_labels_by_triple = workspace_resolution.workspace_dep_labels_by_triple
-    workspace_dep_versions_by_name = workspace_resolution.workspace_dep_versions_by_name
+    if unit_graphs:
+        workspace_resolution = initialize_workspace_unit_graph_resolution(
+            cargo_metadata,
+            versions_by_name,
+            feature_resolutions_by_fq_crate,
+            platform_triples,
+        )
+        cfg_match_cache = workspace_resolution.cfg_match_cache
+        platform_cfg_attrs = workspace_resolution.platform_cfg_attrs
+        mctx.report_progress("Materializing dependencies and features from Cargo unit graph")
+        unit_graph_resolution = apply_unit_graphs_to_feature_resolutions(
+            cargo_metadata = cargo_metadata,
+            dep_label_prefix = "@%s//:" % hub_name,
+            feature_resolutions_by_fq_crate = feature_resolutions_by_fq_crate,
+            platform_triples = platform_triples,
+            unit_graphs = unit_graphs,
+        )
+        workspace_dep_labels_by_triple = unit_graph_resolution.workspace_dep_labels_by_triple
+        workspace_dep_versions_by_name = unit_graph_resolution.workspace_dep_versions_by_name
+    else:
+        workspace_resolution = resolve_cargo_workspace_members(
+            mctx,
+            cargo_metadata = cargo_metadata,
+            packages = packages,
+            workspace_members = workspace_members,
+            versions_by_name = versions_by_name,
+            feature_resolutions_by_fq_crate = feature_resolutions_by_fq_crate,
+            annotations = annotations,
+            platform_triples = platform_triples,
+            materialize_workspace_members = False,
+            validate_lockfile = validate_lockfile,
+            debug = debug,
+            dep_label_prefix = "@%s//:" % hub_name,
+            watch_manifests = watch_manifests,
+            use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
+        )
+        cfg_match_cache = workspace_resolution.cfg_match_cache
+        platform_cfg_attrs = workspace_resolution.platform_cfg_attrs
+        workspace_dep_labels_by_triple = workspace_resolution.workspace_dep_labels_by_triple
+        workspace_dep_versions_by_name = workspace_resolution.workspace_dep_versions_by_name
 
     _date(mctx, "set up initial deps!")
 
@@ -558,7 +601,11 @@ cargo_lints(
 
     defs_bzl_contents = \
         """load(":data.bzl", "DEP_DATA")
-load("@rules_rs//rs/private:all_crate_deps.bzl", _all_crate_deps = "all_crate_deps")
+load(
+    "@rules_rs//rs/private:all_crate_deps.bzl",
+    "merge_structured_dep_specs",
+    _all_crate_deps = "all_crate_deps",
+)
 
 _PLATFORMS = [
     {platforms}
@@ -591,6 +638,23 @@ def all_crate_deps(
         filter_prefix = {this_repo} if cargo_only else None,
     )
 
+def crate_features(package_name = None):
+    dep_data = DEP_DATA.get(package_name or native.package_name())
+    if not dep_data:
+        return []
+
+    features, per_platform = merge_structured_dep_specs(
+        [(dep_data.get("crate_features", []), dep_data.get("crate_features_by_platform", {{}}))],
+        _PLATFORMS,
+        None,
+    )
+    if not per_platform:
+        return features
+
+    branches = {{platform: features for platform, features in sorted(per_platform.items())}}
+    branches["//conditions:default"] = []
+    return features + select(branches)
+
 RESOLVED_PLATFORMS = select({{
     {target_compatible_with},
     "//conditions:default": ["@platforms//:incompatible"],
@@ -612,6 +676,7 @@ RESOLVED_PLATFORMS = select({{
         repo_root = repo_root,
         workspace_package = workspace_package,
         use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
+        use_resolved_deps = use_cargo_unit_graph,
     ))
 
     if dry_run:
@@ -722,9 +787,9 @@ def _crate_impl(mctx):
 
             if cfg.debug:
                 for _ in range(25):
-                    _generate_hub_and_spokes(mctx, cfg.name, annotations, suggested_annotation_snippet_paths, cargo_path, cfg.cargo_lock, cargo_toml_by_hub_name[cfg.name], hub_packages, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, cfg.use_legacy_rules_rust_platforms, dry_run = True)
+                    _generate_hub_and_spokes(mctx, cfg.name, annotations, suggested_annotation_snippet_paths, cargo_path, cfg.cargo_lock, cargo_toml_by_hub_name[cfg.name], hub_packages, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, cfg.use_legacy_rules_rust_platforms, cfg.use_cargo_unit_graph, cfg.cargo_unit_graph_modes, dry_run = True)
 
-            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, suggested_annotation_snippet_paths, cargo_path, cfg.cargo_lock, cargo_toml_by_hub_name[cfg.name], hub_packages, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, cfg.use_legacy_rules_rust_platforms)
+            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, suggested_annotation_snippet_paths, cargo_path, cfg.cargo_lock, cargo_toml_by_hub_name[cfg.name], hub_packages, cfg.platform_triples, cargo_credentials, cfg.cargo_config, cfg.validate_lockfile, cfg.debug, cfg.use_legacy_rules_rust_platforms, cfg.use_cargo_unit_graph, cfg.cargo_unit_graph_modes)
 
     # Lay down the git repos with generated per-crate BUILD overlays.
     git_repos = {}
@@ -841,6 +906,14 @@ _from_cargo = tag_class(
             default = True,
         ),
         "debug": attr.bool(),
+        "use_cargo_unit_graph": attr.bool(
+            doc = "Experimental: query Cargo's unstable --unit-graph output for dependency/features semantics.",
+            default = False,
+        ),
+        "cargo_unit_graph_modes": attr.string_list(
+            doc = "Cargo commands to query when use_cargo_unit_graph is enabled.",
+            default = ["build"],
+        ),
     },
 )
 

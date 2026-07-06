@@ -1,0 +1,11 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_features")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_test(
+    name = "app_test",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_features = crate_features(),
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)

@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "app",
+    "local_util",
+]
+resolver = "3"
+
+[patch.crates-io]
+itoa = { path = "patched_itoa" }

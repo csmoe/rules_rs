@@ -1,0 +1,13 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_features")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "local_util",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    crate_features = crate_features(),
+    edition = "2024",
+    deps = all_crate_deps(normal = True),
+)
